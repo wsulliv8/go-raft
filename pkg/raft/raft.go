@@ -129,14 +129,34 @@ func (n *Node) startElection() {
 }
 
 func (n *Node) sendHeartbeats() {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	if n.state != Leader {
+		return
+	}
+
+	log.Printf("Node %s sending heartbeats to followers", n.Id)
+
 	for _, peer := range n.Peers {
-		go func(peer *rpc.Client) {
+		go func(p *rpc.Client) {
+			args := AppendEntriesArgs{
+				Term: n.currentTerm,
+				LeaderId: n.Id,
+				PrevLogIndex: n.nextIndex[i] - 1,
+				PrevLogTerm: n.log[n.nextIndex[i] - 1].Term,
+				Entries: n.log[n.nextIndex[i]:],
+				LeaderCommit: n.commitIndex,
+			}
 			var reply AppendEntriesReply
-			if err := peer.Call("Node.AppendEntries", args, &reply); err != nil {
-				log.Printf("Error sending AppendEntries to %s: %v", peer, err)
+			if err := p.Call("Node.AppendEntries", args, &reply); err != nil {
+				log.Printf("Error sending AppendEntries to %s: %v", p, err)
+				return
+			}
+			if reply.Term > n.currentTerm {
+				n.demoteCh <- true
 			}
 		}(peer)
-	}
 }
 
 // Main Event Loop
