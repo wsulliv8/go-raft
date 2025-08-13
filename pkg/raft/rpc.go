@@ -28,8 +28,6 @@ type AppendEntriesReply struct {
 	Success bool
 }
 
-// TODO: Implement replicate log function (log request) for leader
-
 func (n *Node) logUpToDate(lastLogIndex int, lastLogTerm int) bool {
 	followerLastLogIndex, followerLastLogTerm := 0,0
 	if len(n.log) > 0 {
