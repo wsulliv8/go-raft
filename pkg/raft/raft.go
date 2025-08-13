@@ -34,13 +34,16 @@ type Node struct {
 	// Timing variables
 	electionTimeout time.Duration // Time to wait before starting an election
 	heartbeatTimeout time.Duration // Time between heartbeats
-	heartbeatCh chan struct{} // Channel to signal heartbeat
 	stopCh chan struct{} // Channel to signal stop
 
 	// Vote tracking
-	votesCh chan bool // Channel to count votes
-	votes int // Number of votes received
-	demoteCh chan bool // Channel to signal demotion to follower
+	// Vote channel carries voterId to ensure idempotency and prevent duplicate votes
+	votesCh chan struct {
+		granted bool
+		voterId string
+	} // Channel to count votes
+	votes map[string]bool // Number of votes received - ensure idemptotent
+	demoteCh chan struct{} // Channel to signal demotion to follower
 }
 
 func NewNode(id string, addr string) *Node {
@@ -112,17 +115,19 @@ func (n *Node) startElection() {
 			if err := peer.Call("Node.RequestVote", args, &reply); err != nil {
 				log.Printf("Error sending RequestVote to %s: %v", peer, err)
 			}
+			n.mu.Lock()
 			if reply.Term > n.currentTerm {
-				n.mu.Lock()
 				n.currentTerm = reply.Term
-				n.state = Follower
-				n.votedFor = ""
 				n.mu.Unlock()
+				n.demoteCh <- struct{}{}
+				return
 			}
+			n.mu.Unlock()
+
 			if reply.VoteGranted {
-				n.votesCh <- true
+				n.votesCh <- struct { granted bool; voterId string } { granted: true, voterId: args.CandidateId }
 			} else {
-				n.votesCh <- false
+				n.votesCh <- struct { granted bool; voterId string } { granted: false, voterId: args.CandidateId }
 			}
 		}(peer)
 	}
@@ -154,9 +159,10 @@ func (n *Node) sendHeartbeats() {
 				return
 			}
 			if reply.Term > n.currentTerm {
-				n.demoteCh <- true
+				n.demoteCh <- struct{}{}
 			}
 		}(peer)
+	}
 }
 
 // Main Event Loop
@@ -185,8 +191,9 @@ func (n *Node) run() {
 						n.currentTerm++
 						n.votedFor = n.Id
 						n.state = Candidate
-						n.votes = 1
-						n.votesCh = make(chan bool, len(n.Peers)) // Buffer channel to avoid blocking
+						n.votes = make(map[string]bool)
+						n.votes[n.Id] = true
+						n.votesCh = make(chan struct { granted bool; voterId string }, len(n.Peers)) // Buffer channel to avoid blocking
 						go n.startElection() // Start election in background
 						n.mu.Unlock()
 						resetTimer(election, randElection(n.electionTimeout))
@@ -204,17 +211,18 @@ func (n *Node) run() {
 						n.currentTerm++
 						n.votedFor = n.Id
 						n.state = Candidate
-						n.votes = 1
-						n.votesCh = make(chan bool, len(n.Peers)) // Buffer channel to avoid blocking
+						n.votes = make(map[string]bool)
+						n.votes[n.Id] = true
+						n.votesCh = make(chan struct { granted bool; voterId string }, len(n.Peers)) // Buffer channel to avoid blocking
 						go n.startElection() // Start election in background
 						n.mu.Unlock()
 						resetTimer(election, randElection(n.electionTimeout))
 					// Vote received
 					case vote := <-n.votesCh:
 						n.mu.Lock()
-						if vote {
-							n.votes++
-							if n.votes > len(n.Peers)/2 {
+						if vote.granted {
+							n.votes[vote.voterId] = true
+							if len(n.votes) > len(n.Peers)/2 {
 								log.Printf("Node %s won election. Becoming leader.", n.Id)
 								// Initialize Leader state
 								n.state = Leader
@@ -240,9 +248,18 @@ func (n *Node) run() {
 							}
 						}
 						n.mu.Unlock()
+						case <- n.demoteCh:
+							n.mu.Lock()
+							log.Printf("Node %s demoted to follower", n.Id)
+							n.state = Follower
+							n.votedFor = ""
+							n.mu.Unlock()
+							resetTimer(election, randElection(n.electionTimeout))
 				}
 
 			case Leader:
+				// TODO: Implement receive message action
+				// TODO: What if a node other than leader receives message? Need to send to leader
 				select {
 					case <- n.stopCh:
 						return
