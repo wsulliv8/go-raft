@@ -28,6 +28,24 @@ type AppendEntriesReply struct {
 	Success bool
 }
 
+// Command RPCs are sent by clients to the leader
+type CommandArgs struct {
+	Command []byte
+}
+
+type CommandReply struct {
+	Success bool
+	LeaderId string // So follower can redirect clients
+	CurrentTerm int // For leader to update itself
+}
+
+// ApplyMsg used to pass committed log entries to state machine
+type ApplyMsg struct {
+	Index int
+	Command []byte
+	UseSnapshot bool
+}
+
 func (n *Node) logUpToDate(lastLogIndex int, lastLogTerm int) bool {
 	followerLastLogIndex, followerLastLogTerm := 0,0
 	if len(n.log) > 0 {

@@ -15,7 +15,6 @@ type Node struct {
 	mu sync.RWMutex
 	wg sync.WaitGroup
 	Peers []*rpc.Client // RPC clients to all other servers
-	currentLeader string // Followers route client messages to leader
 
 	// Persistent state (updated on stable storage before responding to RPCs)
 	// TODO: IMPLEMENT PERSISTENT STATE LATER
@@ -47,6 +46,12 @@ type Node struct {
 	} // Channel to count votes
 	votes map[string]bool // Number of votes received - ensure idemptotent
 	demoteCh chan struct{} // Channel to signal demotion to follower
+
+	// Client communication
+	currentLeader string // Followers route client messages to leader
+	applyCh chan ApplyMsg // Channel to send committed log entries to state machine
+	commitCh chan struct{} // Channel to send commit index to state machine
+	clientRequests map[int]chan CommandReply // Track client IDs and response channels 
 }
 
 func NewNode(id string, addr string) *Node {
