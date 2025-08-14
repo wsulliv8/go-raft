@@ -7,6 +7,7 @@ import (
 	"math/rand"
 	"net/rpc"
 	"github.com/wsulliv8/go-raft/pkg/kvstore"
+	"strings"
 )
 
 type State int
@@ -165,10 +166,12 @@ func (n *Node) applyLogEntry(entry LogEntry) {
 	switch op {
 	case "SET":
 		n.kvstore.Set(key, value)
+		log.Printf("Node %s set key %s to %s", n.Id, key, value)
 	case "GET":
-		value, err := n.kvstore.Get(key)
-		if err != nil {
-			log.Printf("Error getting value for key %s: %v", key, err)
+		value, ok := n.kvstore.Get(key)
+		log.Printf("Node %s got value %s for key %s", n.Id, value, key)
+		if !ok {
+			log.Printf("Key %s not found", key)
 		}
 	default:
 		log.Printf("Invalid operation: %s", op)
