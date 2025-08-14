@@ -9,6 +9,14 @@ import (
 	"github.com/wsulliv8/go-raft/pkg/kvstore"
 )
 
+type State int
+
+const (
+	Follower State = iota
+	Leader
+	Candidate
+)
+
 // Node state struct derived from the Raft paper
 type Node struct {
 	Id string

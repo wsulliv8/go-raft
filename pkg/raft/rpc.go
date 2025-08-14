@@ -2,6 +2,12 @@ package raft
 
 import "log"
 
+type LogEntry struct {
+	Index int
+	Term int
+	Command []byte
+}
+
 type RequestVoteArgs struct {
 	Term int
 	CandidateId string
