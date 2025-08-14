@@ -28,6 +28,14 @@ type AppendEntriesReply struct {
 	Success bool
 }
 
+// Command format. Struct that can be serialized and deserialized to bytes. 
+// TODO: Have client serialize struc using encoding/json and applyLogEntry deserialize back into Command
+type Command struct {
+	Op string
+	Key string
+	Value string
+}
+
 // Command RPCs are sent by clients to the leader
 type CommandArgs struct {
 	Command []byte
@@ -39,11 +47,120 @@ type CommandReply struct {
 	CurrentTerm int // For leader to update itself
 }
 
-// ApplyMsg used to pass committed log entries to state machine
-type ApplyMsg struct {
-	Index int
-	Command []byte
-	UseSnapshot bool
+// RPC Handler for Client Requests
+func (n *Node) Command(args *CommandArgs, reply *CommandReply) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	// Redirect client to leader
+	if n.state != Leader {
+		reply.Success = false
+		reply.LeaderId = n.currentLeader
+		reply.CurrentTerm = n.currentTerm
+		return nil
+	}
+
+	// Append command to log
+	entry := LogEntry{
+		Index: len(n.log),
+		Term: n.currentTerm,
+		Command: args.Command,
+	}
+	n.log = append(n.log, entry)
+	log.Printf("Node %s appended command to log", n.Id)
+
+	// Create channel to wait for command to be committed
+	commitIndex := len(n.log) - 1
+	respCh := make(chan CommandReply, 1)
+	n.clientRequests[commitIndex] = respCh
+
+	// Send AppendEntries to all followers
+	for i := range n.Peers {
+		n.sendAppendEntries(i)
+	}
+
+	n.mu.Unlock()
+	// Block and wait for response from main loop (synchronous from client's perspective)
+	*reply = <-respCh
+	n.mu.Lock()
+
+	return nil
+}
+
+// Helper function for leader to send AppendEntries to all followers. Responsible for heartbeats and log replication.
+func (n *Node) sendAppendEntries(peerIndex int) {
+	n.mu.RLock()
+	
+	if n.state != Leader {
+		n.mu.RUnlock()
+		return
+	}
+
+	prevLogIndex, prevLogTerm := n.nextIndex[peerIndex] - 1,-1
+	if len(n.log) >= 0 {
+		prevLogTerm = n.log[prevLogIndex].Term
+	}
+
+	args := AppendEntriesArgs{
+		Term: n.currentTerm,
+		LeaderId: n.Id,
+		PrevLogIndex: prevLogIndex,
+		PrevLogTerm: prevLogTerm,
+		Entries: n.log[prevLogIndex+1:],
+		LeaderCommit: n.commitIndex,
+	}
+
+	n.mu.RUnlock()
+
+	peer := n.Peers[peerIndex]
+	var reply AppendEntriesReply
+	go func() {
+		if err := peer.Call("Node.AppendEntries", &args, &reply); err != nil {
+			log.Printf("Node %s failed to send AppendEntries to %s: %v", n.Id, peer.Server(), err)
+			return
+		}
+
+		n.mu.Lock()
+		defer n.mu.Unlock()
+
+	if reply.Term > n.currentTerm {
+			n.demoteCh <- struct{}{}
+			return
+		}
+
+		if reply.Success {
+			// Followers log is up to date, update nextIndex and matchIndex
+			n.nextIndex[peerIndex] = len(n.log)
+			n.matchIndex[peerIndex] = len(n.log) - 1
+			
+			// Check if a new entry can be committed by iterating backwards from latest entry to see if majority have it 
+			for i := len(n.log) - 1; i > n.commitIndex; i-- {
+				// Skip entries from previous terms
+				if n.log[i].Term != n.currentTerm {
+					continue
+				}
+
+				// Count number of followers that have the entry
+				majorityCount := 1
+				for _, match := range n.matchIndex {
+					if match >= i {
+						majorityCount++
+					}
+				}
+
+				if majorityCount > len(n.Peers) / 2 {
+					n.commitIndex = i
+					n.commitCh <- struct{}{}
+					break
+				}
+			}
+		}else {
+			// Followers log is not up to date, decrement nextIndex and retry
+			n.nextIndex[peerIndex]--
+			log.Printf("AppendEntries failed for peer %s. Decrementing nextIndex to %d and retrying.", peerIndex, n.nextIndex[peerIndex])
+			n.sendAppendEntries(peerIndex)
+		}
+	}()
 }
 
 func (n *Node) logUpToDate(lastLogIndex int, lastLogTerm int) bool {
@@ -144,4 +261,11 @@ func (n *Node) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) 
 	reply.Success = true
 	
 	return nil
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }

@@ -6,6 +6,7 @@ import (
 	"time"
 	"math/rand"
 	"net/rpc"
+	"github.com/wsulliv8/go-raft/pkg/kvstore"
 )
 
 // Node state struct derived from the Raft paper
@@ -49,9 +50,12 @@ type Node struct {
 
 	// Client communication
 	currentLeader string // Followers route client messages to leader
-	applyCh chan ApplyMsg // Channel to send committed log entries to state machine
 	commitCh chan struct{} // Channel to send commit index to state machine
 	clientRequests map[int]chan CommandReply // Track client IDs and response channels 
+
+	// State machine
+	kvstore *kvstore.KVStore
+	applyCh chan LogEntry // Channel to send committed log entries to state machine
 }
 
 func NewNode(id string, addr string) *Node {
@@ -63,6 +67,8 @@ func NewNode(id string, addr string) *Node {
 		votedFor: "",
 		log: []LogEntry{},
 		commitIndex: 0,
+		kvstore: kvstore.NewKVStore(),
+		applyCh: make(chan LogEntry),
 	}
 }
 
@@ -130,43 +136,34 @@ func (n *Node) startElection() {
 	}
 }
 
-func (n *Node) sendHeartbeats() {
-	n.mu.RLock()
-	defer n.mu.RUnlock()
+// Parse command from log entry and apply to state machine
+func (n *Node) applyLogEntry(entry LogEntry) {
+	command := string(entry.Command)
+	parts := strings.Split(command, " ")
 
-	if n.state != Leader {
+	if len(parts) < 2 {
+		log.Printf("Invalid command: %s", command)
 		return
 	}
 
-	log.Printf("Node %s sending heartbeats to followers", n.Id)
+	op := parts[0]
+	key := parts[1]
+	value := ""
 
-	for _, peer := range n.Peers {
-		go func(p *rpc.Client) {
-			n.mu.RLock()
+	if len(parts) > 2 {
+		value = parts[2]
+	}
 
-			lastLogIndex, lastLogTerm := 0,0
-			if len(n.log) > 0 {
-				lastLogIndex = len(n.log) - 1
-				lastLogTerm = n.log[lastLogIndex].Term
-			}
-			args := AppendEntriesArgs{
-				Term: n.currentTerm,
-				LeaderId: n.Id,
-				PrevLogIndex: lastLogIndex,
-				PrevLogTerm: lastLogTerm,
-				Entries: []LogEntry{},
-				LeaderCommit: n.commitIndex,
-			}
-			n.mu.RUnlock()
-
-			var reply AppendEntriesReply
-			if err := p.Call("Node.AppendEntries", args, &reply); err != nil {
-				return
-			}
-			if reply.Term > n.currentTerm {
-				n.demoteCh <- struct{}{}
-			}
-		}(peer)
+	switch op {
+	case "SET":
+		n.kvstore.Set(key, value)
+	case "GET":
+		value, err := n.kvstore.Get(key)
+		if err != nil {
+			log.Printf("Error getting value for key %s: %v", key, err)
+		}
+	default:
+		log.Printf("Invalid operation: %s", op)
 	}
 }
 
@@ -228,7 +225,11 @@ func (n *Node) run() {
 					case vote := <-n.votesCh:
 						n.mu.Lock()
 						if vote.granted {
-							n.votes[vote.voterId] = true
+							if _, ok := n.votes[vote.voterId]; !ok {
+								n.votes[vote.voterId] = true
+								log.Printf("Node %s received vote from %s", n.Id, vote.voterId)
+							}
+							// If received majority of votes, become leader
 							if len(n.votes) > len(n.Peers)/2 {
 								log.Printf("Node %s won election. Becoming leader.", n.Id)
 								// Initialize Leader state
@@ -242,10 +243,7 @@ func (n *Node) run() {
 								if !n.electionTimer.Stop() { select { case <-n.electionTimer.C: default: } } // If Stop failed, read channel to avoid blocking
 								
 								// Leader sends initial heartbeats to followers
-								n.sendHeartbeats() 
-
-								// Start periodic heartbeats
-								n.heartbeatTimer.Reset(n.heartbeatTimeout)
+								n.heartbeatTimer.Reset(0) // Fire immediately
 
 							} else {
 								log.Printf("Node %s lost election. Becoming follower.", n.Id)
@@ -271,7 +269,10 @@ func (n *Node) run() {
 					case <- n.stopCh:
 						return
 					case <- n.heartbeatTimer.C:
-						n.sendHeartbeats()
+						// Send heartbeats to followers
+						for i := range n.Peers {
+							n.sendAppendEntries(i)
+						}
 						n.heartbeatTimer.Reset(n.heartbeatTimeout)
 					case <- n.demoteCh:
 						n.mu.Lock()
@@ -280,7 +281,48 @@ func (n *Node) run() {
 						n.votedFor = ""
 						n.mu.Unlock()
 						n.electionTimer.Reset(n.electionTimeout)
+					case <- n.commitCh:
+						n.mu.Lock()
+						for n.lastApplied < n.commitIndex {
+							n.lastApplied++
+							entry := n.log[n.lastApplied]
+							
+							// Send command to state machine
+							n.applyCh <- entry
+							log.Printf("Node %s applied log entry %d", n.Id, n.lastApplied)
+
+							// If this was a client request, send response
+							if respCh, ok := n.clientRequests[n.lastApplied]; ok {
+								respCh <- CommandReply{
+									Success: true,
+									LeaderId: n.Id,
+									CurrentTerm: n.currentTerm,
+								}
+								delete(n.clientRequests, n.lastApplied)
+							}
+						}
+						n.mu.Unlock()
+				// Apply log entry to state machine - applicable to all states
+				case entry := <- n.applyCh:
+					n.mu.Lock()
+
+					if entry.Index == n.lastApplied + 1 {
+						n.applyLogEntry(entry)
+						n.lastApplied++
+					}
+					
+					// If this is a client request, send response
+					if respCh, ok := n.clientRequests[entry.Index]; ok {
+						respCh <- CommandReply{
+							Success: true,
+							LeaderId: n.Id,
+							CurrentTerm: n.currentTerm,
+						}
+						delete(n.clientRequests, entry.Index)
+					}
+					n.mu.Unlock()
+				}
 			}
 		}
-	}
 }
+

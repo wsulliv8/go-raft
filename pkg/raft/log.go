@@ -5,8 +5,9 @@ import (
 )
 
 type LogEntry struct {
+	Index int
 	Term int
-	Command string
+	Command []byte
 }
 
 type Log struct {
