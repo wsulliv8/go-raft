@@ -2,14 +2,17 @@ package main
 
 import (
 	"log"
+	"math/rand"
+	"net"
+	"net/rpc"
 	"os"
 	"os/signal"
-	"syscall"
-	"sync"
-	"github.com/wsulliv8/go-raft/pkg/raft"
 	"strconv"
-	"net/rpc"
-	"net"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/wsulliv8/go-raft/pkg/raft"
 )
 
 // Connect to peers and start servers using separate goroutines
@@ -27,13 +30,16 @@ func connectToPeers(addresses []string) []*raft.Node {
 		go func(node *raft.Node) {
 			defer serverWg.Done()
 			
-			rpc.Register(node)
+			srv := rpc.NewServer()
+			if err := srv.RegisterName("Node", node); err != nil {
+				log.Fatalf("Failed to register RPC for node %s: %v", node.Id, err)
+			}
 			listener, err := net.Listen("tcp", node.Addr)
 			if err != nil {
 				log.Fatalf("Failed to listen on %s: %v", node.Addr, err)
 			}
 			
-			go rpc.Accept(listener) // serve RPCs in background 
+			go srv.Accept(listener) // serve RPCs in background 
 
 			log.Printf("Server %s listening on %s", node.Id, node.Addr)
 		}(node)
@@ -62,6 +68,7 @@ func connectToPeers(addresses []string) []*raft.Node {
 }
 
 func main() {
+    rand.Seed(time.Now().UnixNano())
 	addresses := []string{
 		"127.0.0.1:50001",
 		"127.0.0.1:50002",
