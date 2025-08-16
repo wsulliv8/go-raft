@@ -18,11 +18,13 @@ type RequestVoteArgs struct {
 type RequestVoteReply struct {
 	Term int
 	VoteGranted bool
+    VoterId string
 }
 
 type AppendEntriesArgs struct {
 	Term int
 	LeaderId string
+	LeaderAddr string
 	PrevLogIndex int
 	PrevLogTerm int
 	Entries []LogEntry
@@ -102,14 +104,15 @@ func (n *Node) sendAppendEntries(peerIndex int) {
 		return
 	}
 
-	prevLogIndex, prevLogTerm := n.nextIndex[peerIndex] - 1,-1
-	if len(n.log) >= 0 {
-		prevLogTerm = n.log[prevLogIndex].Term
-	}
+    prevLogIndex, prevLogTerm := n.nextIndex[peerIndex]-1, -1
+    if prevLogIndex >= 0 {
+        prevLogTerm = n.log[prevLogIndex].Term
+    }
 
 	args := AppendEntriesArgs{
 		Term: n.currentTerm,
 		LeaderId: n.Id,
+		LeaderAddr: n.Addr,
 		PrevLogIndex: prevLogIndex,
 		PrevLogTerm: prevLogTerm,
 		Entries: n.log[prevLogIndex+1:],
@@ -122,7 +125,7 @@ func (n *Node) sendAppendEntries(peerIndex int) {
 	var reply AppendEntriesReply
 	go func() {
 		if err := peer.Call("Node.AppendEntries", &args, &reply); err != nil {
-			log.Printf("Node %s failed to send AppendEntries to %s: %v", n.Id, peer.Server(), err)
+			log.Printf("Node %s failed to send AppendEntries to %s: %v", n.Id, peer, err)
 			return
 		}
 
@@ -196,14 +199,20 @@ func (n *Node) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) error 
 		n.votedFor = ""
 	}
 
-	// Grant vote if votedFor is empty or candidateId AND candidate's log is at least as up to date as receiver's log
-	if (n.votedFor == "" || n.votedFor == args.CandidateId) && n.logUpToDate(args.LastLogIndex, args.LastLogTerm) {
+    // Grant vote if votedFor is empty or candidateId AND candidate's log is at least as up to date as receiver's log
+    if (n.votedFor == "" || n.votedFor == args.CandidateId) && n.logUpToDate(args.LastLogIndex, args.LastLogTerm) {
 		reply.Term = n.currentTerm
 		reply.VoteGranted = true
+        reply.VoterId = n.Id
 		n.votedFor = args.CandidateId
+        // Reset election timer when granting a vote to reduce split votes
+        if n.electionTimer != nil {
+            n.electionTimer.Reset(n.randomizeElectionTimeout())
+        }
 	} else {
 		reply.Term = n.currentTerm
 		reply.VoteGranted = false
+        reply.VoterId = n.Id
 	}
 
 	return nil
@@ -227,12 +236,13 @@ func (n *Node) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) 
 		n.votedFor = ""
 	}
 
-	n.currentLeader = args.LeaderId
+	// Store leader address for client redirects
+	n.currentLeader = args.LeaderAddr
 
 	// Valid leader, reset election timer
-	n.electionTimer.Reset(n.electionTimeout)
+	n.electionTimer.Reset(n.randomizeElectionTimeout())
 
-	log.Printf("Node %s received AppendEntries from leader %s", n.Id, args.LeaderId)
+	// log.Printf("Node %s received AppendEntries from leader %s", n.Id, args.LeaderId)
 
 	// Verify log contains more entries than prefix of leader's log and the term of the last entry in prefix matches
 	if args.PrevLogIndex >= 0 && (len(n.log) <= args.PrevLogIndex || n.log[args.PrevLogIndex].Term != args.PrevLogTerm) {

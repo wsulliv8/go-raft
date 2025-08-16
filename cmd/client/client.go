@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"log"
+	"net"
 	"net/rpc"
 	"os"
 	"time"
@@ -35,21 +36,35 @@ func main() {
 	currentServer := serverAddr
 
 	for {
-		client, err := rpc.Dial("tcp", currentServer)
+		// Dial with timeout to avoid hangs
+		d := net.Dialer{Timeout: 2 * time.Second}
+		conn, err := d.Dial("tcp", currentServer)
 		if err != nil {
 			log.Printf("Failed to connect to %s: %v", currentServer, err)
 			time.Sleep(1 * time.Second)
 			continue
 		}
-		defer client.Close()
+		client := rpc.NewClient(conn)
 
 		args := CommandArgs{Command: []byte(command)}
 		var reply CommandReply
 
 		log.Printf("Sending command to %s", currentServer)
 
-		if err := client.Call("Node.Command", &args, &reply); err != nil {
-			log.Printf("Failed to send command to %s: %v", currentServer, err)
+		done := make(chan error, 1)
+		go func() { done <- client.Call("Node.Command", &args, &reply) }()
+
+		select {
+		case err := <-done:
+			client.Close()
+			if err != nil {
+				log.Printf("Failed to send command to %s: %v", currentServer, err)
+				time.Sleep(1 * time.Second)
+				continue
+			}
+		case <-time.After(3 * time.Second):
+			client.Close()
+			log.Printf("RPC to %s timed out", currentServer)
 			time.Sleep(1 * time.Second)
 			continue
 		}
@@ -61,7 +76,7 @@ func main() {
 
 		if reply.LeaderId != "" {
 			log.Printf("Redirecting to leader %s", reply.LeaderId)
-			currentServer = reply.LeaderId
+			currentServer = reply.LeaderId // now an address
 			continue
 		}
 

@@ -2,12 +2,13 @@ package raft
 
 import (
 	"log"
-	"sync"
-	"time"
 	"math/rand"
 	"net/rpc"
-	"github.com/wsulliv8/go-raft/pkg/kvstore"
 	"strings"
+	"sync"
+	"time"
+
+	"github.com/wsulliv8/go-raft/pkg/kvstore"
 )
 
 type State int
@@ -42,7 +43,6 @@ type Node struct {
 	matchIndex []int // Index of highest log entry known to be replicated on each server
 
 	// Timing variables
-	electionTimeout time.Duration // Time to wait before starting an election
 	heartbeatTimeout time.Duration // Time between heartbeats
 	electionTimer *time.Timer
 	heartbeatTimer *time.Timer
@@ -78,6 +78,9 @@ func NewNode(id string, addr string) *Node {
 		commitIndex: 0,
 		kvstore: kvstore.NewKVStore(),
 		applyCh: make(chan LogEntry),
+		demoteCh: make(chan struct{}),
+		commitCh: make(chan struct{}),
+		clientRequests: make(map[int]chan CommandReply),
 	}
 }
 
@@ -105,6 +108,10 @@ func (n *Node) Stop() {
 		}
 	}
 	log.Printf("Node %s stopped", n.Id)
+}
+
+func (n *Node) randomizeElectionTimeout() time.Duration {
+	return time.Duration(150+rand.Intn(150)) * time.Millisecond
 }
 
 func (n *Node) startElection() {
@@ -137,9 +144,9 @@ func (n *Node) startElection() {
 			n.mu.Unlock()
 
 			if reply.VoteGranted {
-				n.votesCh <- struct { granted bool; voterId string } { granted: true, voterId: args.CandidateId }
+				n.votesCh <- struct { granted bool; voterId string } { granted: true, voterId: reply.VoterId }
 			} else {
-				n.votesCh <- struct { granted bool; voterId string } { granted: false, voterId: args.CandidateId }
+				n.votesCh <- struct { granted bool; voterId string } { granted: false, voterId: reply.VoterId }
 			}
 		}(peer)
 	}
@@ -180,14 +187,18 @@ func (n *Node) applyLogEntry(entry LogEntry) {
 
 // Main Event Loop
 func (n *Node) run() {
-	n.wg.Add(1)
 	defer n.wg.Done()
 
 	// Initialize timers
-	n.electionTimeout = time.Duration(150 + rand.Intn(150)) * time.Millisecond
-	n.electionTimer = time.NewTimer(n.electionTimeout)
+	n.electionTimer = time.NewTimer(n.randomizeElectionTimeout())
 	n.heartbeatTimeout = time.Duration(50) * time.Millisecond
 	n.heartbeatTimer = time.NewTimer(n.heartbeatTimeout)
+	
+	// Stop heartbeat timer initially since nodes start as followers
+	if !n.heartbeatTimer.Stop() {
+		select { case <-n.heartbeatTimer.C: default: }
+	}
+	
 	defer n.electionTimer.Stop()
 	defer n.heartbeatTimer.Stop()
 	
@@ -211,7 +222,7 @@ func (n *Node) run() {
 						n.votesCh = make(chan struct { granted bool; voterId string }, len(n.Peers)) // Buffer channel to avoid blocking
 						go n.startElection() // Start election in background
 						n.mu.Unlock()
-						n.electionTimer.Reset(n.electionTimeout)
+						n.electionTimer.Reset(n.randomizeElectionTimeout())
 					}
 
 			case Candidate:
@@ -231,7 +242,7 @@ func (n *Node) run() {
 						n.votesCh = make(chan struct { granted bool; voterId string }, len(n.Peers)) // Buffer channel to avoid blocking
 						go n.startElection() // Start election in background
 						n.mu.Unlock()
-						n.electionTimer.Reset(n.electionTimeout)
+						n.electionTimer.Reset(n.randomizeElectionTimeout())
 					// Vote received
 					case vote := <-n.votesCh:
 						n.mu.Lock()
@@ -255,12 +266,6 @@ func (n *Node) run() {
 								
 								// Leader sends initial heartbeats to followers
 								n.heartbeatTimer.Reset(0) // Fire immediately
-
-							} else {
-								log.Printf("Node %s lost election. Becoming follower.", n.Id)
-								n.state = Follower
-								n.votedFor = ""
-								n.electionTimer.Reset(n.electionTimeout)
 							}
 						}
 						n.mu.Unlock()
@@ -270,12 +275,10 @@ func (n *Node) run() {
 							n.state = Follower
 							n.votedFor = ""
 							n.mu.Unlock()
-							n.electionTimer.Reset(n.electionTimeout)
+							n.electionTimer.Reset(n.randomizeElectionTimeout())
 				}
 
 			case Leader:
-				// TODO: Implement receive message action
-				// TODO: What if a node other than leader receives message? Need to send to leader
 				select {
 					case <- n.stopCh:
 						return
@@ -291,17 +294,21 @@ func (n *Node) run() {
 						n.state = Follower
 						n.votedFor = ""
 						n.mu.Unlock()
-						n.electionTimer.Reset(n.electionTimeout)
+						// Stop heartbeat timer when demoted from leader
+						if !n.heartbeatTimer.Stop() { 
+							select { case <-n.heartbeatTimer.C: default: } 
+						}
+						n.electionTimer.Reset(n.randomizeElectionTimeout())
 					case <- n.commitCh:
 						n.mu.Lock()
 						for n.lastApplied < n.commitIndex {
 							n.lastApplied++
 							entry := n.log[n.lastApplied]
 							
-							// Send command to state machine
-							n.applyCh <- entry
+							// Apply directly to state machine to avoid deadlock on self-send
+							n.applyLogEntry(entry)
 							log.Printf("Node %s applied log entry %d", n.Id, n.lastApplied)
-
+							
 							// If this was a client request, send response
 							if respCh, ok := n.clientRequests[n.lastApplied]; ok {
 								respCh <- CommandReply{
@@ -316,7 +323,7 @@ func (n *Node) run() {
 				// Apply log entry to state machine - applicable to all states
 				case entry := <- n.applyCh:
 					n.mu.Lock()
-
+					
 					if entry.Index == n.lastApplied + 1 {
 						n.applyLogEntry(entry)
 						n.lastApplied++
@@ -333,7 +340,7 @@ func (n *Node) run() {
 					}
 					n.mu.Unlock()
 				}
-			}
 		}
+	}
 }
 
