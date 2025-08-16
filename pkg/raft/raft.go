@@ -185,6 +185,26 @@ func (n *Node) applyLogEntry(entry LogEntry) {
 	}
 }
 
+// handleCommitCh applies all entries up to commitIndex and replies to waiting clients
+func (n *Node) handleCommitCh() {
+    n.mu.Lock()
+    for n.lastApplied < n.commitIndex {
+        n.lastApplied++
+        entry := n.log[n.lastApplied]
+        n.applyLogEntry(entry)
+        log.Printf("Node %s applied log entry %d", n.Id, n.lastApplied)
+        if respCh, ok := n.clientRequests[n.lastApplied]; ok {
+            respCh <- CommandReply{
+                Success: true,
+                LeaderId: n.Id,
+                CurrentTerm: n.currentTerm,
+            }
+            delete(n.clientRequests, n.lastApplied)
+        }
+    }
+    n.mu.Unlock()
+}
+
 // Main Event Loop
 func (n *Node) run() {
 	defer n.wg.Done()
@@ -209,6 +229,8 @@ func (n *Node) run() {
 				select {
 					case <- n.stopCh:
 						return
+					case <- n.commitCh:
+						n.handleCommitCh()
 					// Election timeout
 					case <-n.electionTimer.C:
 						// Increment current term, become candidate, and vote for self
@@ -229,6 +251,8 @@ func (n *Node) run() {
 				select {
 					case <- n.stopCh:
 						return
+					case <- n.commitCh:
+						n.handleCommitCh()
 					// Election timeout
 					case <-n.electionTimer.C:
 						// Increment current term, become candidate, and vote for self
@@ -300,26 +324,7 @@ func (n *Node) run() {
 						}
 						n.electionTimer.Reset(n.randomizeElectionTimeout())
 					case <- n.commitCh:
-						n.mu.Lock()
-						for n.lastApplied < n.commitIndex {
-							n.lastApplied++
-							entry := n.log[n.lastApplied]
-							
-							// Apply directly to state machine to avoid deadlock on self-send
-							n.applyLogEntry(entry)
-							log.Printf("Node %s applied log entry %d", n.Id, n.lastApplied)
-							
-							// If this was a client request, send response
-							if respCh, ok := n.clientRequests[n.lastApplied]; ok {
-								respCh <- CommandReply{
-									Success: true,
-									LeaderId: n.Id,
-									CurrentTerm: n.currentTerm,
-								}
-								delete(n.clientRequests, n.lastApplied)
-							}
-						}
-						n.mu.Unlock()
+						n.handleCommitCh()
 				// Apply log entry to state machine - applicable to all states
 				case entry := <- n.applyCh:
 					n.mu.Lock()
